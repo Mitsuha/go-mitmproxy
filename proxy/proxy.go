@@ -16,6 +16,9 @@ import (
 type Options struct {
 	Debug             int
 	Addr              string
+	HTTPSAddr         string
+	HTTPSCertFile     string
+	HTTPSKeyFile      string
 	StreamLargeBodies int64 // 当请求或响应体大于此字节时，转为 stream 模式
 	SslInsecure       bool
 	CaRootPath        string
@@ -69,6 +72,9 @@ func (proxy *Proxy) AddAddon(addon Addon) {
 }
 
 func (proxy *Proxy) Start() error {
+	if err := proxy.entry.validateHTTPSConfig(); err != nil {
+		return err
+	}
 	go func() {
 		if err := proxy.attacker.start(); err != nil {
 			log.Error(err)

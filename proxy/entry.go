@@ -3,6 +3,9 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -94,6 +97,49 @@ func (c *wrapClientConn) Close() error {
 	return c.closeErr
 }
 
+type peekableClientConn interface {
+	net.Conn
+	Peek(n int) ([]byte, error)
+	PeekBuffered() ([]byte, error)
+}
+
+type hijackedClientConn struct {
+	net.Conn
+	r       *bufio.Reader
+	connCtx *ConnContext
+}
+
+func newHijackedClientConn(c net.Conn, rw *bufio.ReadWriter, connCtx *ConnContext) *hijackedClientConn {
+	return &hijackedClientConn{
+		Conn:    c,
+		r:       rw.Reader,
+		connCtx: connCtx,
+	}
+}
+
+func (c *hijackedClientConn) Peek(n int) ([]byte, error) {
+	return c.r.Peek(n)
+}
+
+func (c *hijackedClientConn) PeekBuffered() ([]byte, error) {
+	return c.r.Peek(c.r.Buffered())
+}
+
+func (c *hijackedClientConn) Read(data []byte) (int, error) {
+	return c.r.Read(data)
+}
+
+func clientConnContext(c net.Conn) *ConnContext {
+	switch conn := c.(type) {
+	case *wrapClientConn:
+		return conn.connCtx
+	case *hijackedClientConn:
+		return conn.connCtx
+	default:
+		return nil
+	}
+}
+
 // wrap tcpConn for remote server
 type wrapServerConn struct {
 	net.Conn
@@ -134,8 +180,9 @@ func (c *wrapServerConn) Close() error {
 }
 
 type entry struct {
-	proxy  *Proxy
-	server *http.Server
+	proxy       *Proxy
+	server      *http.Server
+	httpsServer *http.Server
 }
 
 func newEntry(proxy *Proxy) *entry {
@@ -144,14 +191,70 @@ func newEntry(proxy *Proxy) *entry {
 		Addr:    proxy.Opts.Addr,
 		Handler: e,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return context.WithValue(ctx, connContextKey, c.(*wrapClientConn).connCtx)
+			return context.WithValue(ctx, connContextKey, connContextFromClientConn(c))
 		},
+	}
+	if proxy.Opts.HTTPSAddr != "" {
+		e.httpsServer = &http.Server{
+			Addr:    proxy.Opts.HTTPSAddr,
+			Handler: e,
+			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				return context.WithValue(ctx, connContextKey, connContextFromClientConn(c))
+			},
+			TLSConfig: &tls.Config{
+				NextProtos: []string{"http/1.1"},
+			},
+		}
 	}
 	return e
 }
 
+func connContextFromClientConn(c net.Conn) *ConnContext {
+	if tlsConn, ok := c.(*tls.Conn); ok {
+		c = tlsConn.NetConn()
+	}
+	return c.(*wrapClientConn).connCtx
+}
+
+func (e *entry) validateHTTPSConfig() error {
+	if e.httpsServer == nil {
+		return nil
+	}
+	if e.proxy.Opts.HTTPSCertFile == "" || e.proxy.Opts.HTTPSKeyFile == "" {
+		return fmt.Errorf("https proxy requires both cert and key files")
+	}
+	cert, err := tls.LoadX509KeyPair(e.proxy.Opts.HTTPSCertFile, e.proxy.Opts.HTTPSKeyFile)
+	if err != nil {
+		return err
+	}
+	e.httpsServer.TLSConfig.Certificates = []tls.Certificate{cert}
+	return nil
+}
+
 func (e *entry) start() error {
-	addr := e.server.Addr
+	if e.httpsServer != nil {
+		return e.startHTTPAndHTTPS()
+	}
+	return e.startServer(e.server, false)
+}
+
+func (e *entry) startHTTPAndHTTPS() error {
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- e.startServer(e.server, false)
+	}()
+	go func() {
+		errCh <- e.startServer(e.httpsServer, true)
+	}()
+	err := <-errCh
+	if err != http.ErrServerClosed {
+		e.close()
+	}
+	return err
+}
+
+func (e *entry) startServer(server *http.Server, isHTTPS bool) error {
+	addr := server.Addr
 	if addr == "" {
 		addr = ":http"
 	}
@@ -160,20 +263,33 @@ func (e *entry) start() error {
 		return err
 	}
 
-	log.Infof("Proxy start listen at %v\n", e.server.Addr)
+	if isHTTPS {
+		log.Infof("HTTPS proxy start listen at %v\n", server.Addr)
+	} else {
+		log.Infof("Proxy start listen at %v\n", server.Addr)
+	}
 	pln := &wrapListener{
 		Listener: ln,
 		proxy:    e.proxy,
 	}
-	return e.server.Serve(pln)
+	if isHTTPS {
+		return server.Serve(tls.NewListener(pln, server.TLSConfig))
+	}
+	return server.Serve(pln)
 }
 
 func (e *entry) close() error {
-	return e.server.Close()
+	if e.httpsServer == nil {
+		return e.server.Close()
+	}
+	return errors.Join(e.server.Close(), e.httpsServer.Close())
 }
 
 func (e *entry) shutdown(ctx context.Context) error {
-	return e.server.Shutdown(ctx)
+	if e.httpsServer == nil {
+		return e.server.Shutdown(ctx)
+	}
+	return errors.Join(e.server.Shutdown(ctx), e.httpsServer.Shutdown(ctx))
 }
 
 func (e *entry) ServeHTTP(res http.ResponseWriter, req *http.Request) {
@@ -253,7 +369,7 @@ func (e *entry) handleConnect(res http.ResponseWriter, req *http.Request) {
 }
 
 func (e *entry) establishConnection(res http.ResponseWriter, f *Flow) (net.Conn, error) {
-	cconn, _, err := res.(http.Hijacker).Hijack()
+	cconn, rw, err := res.(http.Hijacker).Hijack()
 	if err != nil {
 		for _, addon := range e.proxy.Addons {
 			addon.HTTPConnectError(f, err)
@@ -280,7 +396,7 @@ func (e *entry) establishConnection(res http.ResponseWriter, f *Flow) (net.Conn,
 		addon.Responseheaders(f)
 	}
 
-	return cconn, nil
+	return newHijackedClientConn(cconn, rw, f.ConnContext), nil
 }
 
 func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Flow) {
@@ -331,7 +447,8 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	peek, err := cconn.(*wrapClientConn).Peek(3)
+	clientConn := cconn.(peekableClientConn)
+	peek, err := clientConn.Peek(3)
 	if err != nil {
 		cconn.Close()
 		conn.Close()
@@ -345,7 +462,7 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		return
 	}
 
-	wsPeek, err := cconn.(*wrapClientConn).PeekBuffered()
+	wsPeek, err := clientConn.PeekBuffered()
 	if err == io.EOF {
 		err = nil
 	}
@@ -384,7 +501,8 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		return
 	}
 
-	peek, err := cconn.(*wrapClientConn).Peek(3)
+	clientConn := cconn.(peekableClientConn)
+	peek, err := clientConn.Peek(3)
 	if err != nil {
 		cconn.Close()
 		log.Error(err)
@@ -397,7 +515,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		return
 	}
 
-	wsPeek, err := cconn.(*wrapClientConn).PeekBuffered()
+	wsPeek, err := clientConn.PeekBuffered()
 	if err == io.EOF {
 		err = nil
 	}

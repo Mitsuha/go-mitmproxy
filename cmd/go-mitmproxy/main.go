@@ -18,6 +18,9 @@ type Config struct {
 	version bool // show go-mitmproxy version
 
 	Addr         string   // proxy listen addr
+	HTTPSAddr    string   // https proxy listen addr
+	HTTPSCert    string   // https proxy server certificate file
+	HTTPSKey     string   // https proxy server private key file
 	WebAddr      string   // web interface listen addr
 	SslInsecure  bool     // not verify upstream server SSL/TLS certificates.
 	IgnoreHosts  []string // a list of ignore hosts
@@ -58,6 +61,9 @@ func main() {
 	opts := &proxy.Options{
 		Debug:             config.Debug,
 		Addr:              config.Addr,
+		HTTPSAddr:         config.HTTPSAddr,
+		HTTPSCertFile:     config.HTTPSCert,
+		HTTPSKeyFile:      config.HTTPSKey,
 		StreamLargeBodies: 1024 * 1024 * 5,
 		SslInsecure:       config.SslInsecure,
 		CaRootPath:        config.CertPath,
