@@ -194,6 +194,11 @@ func newEntry(proxy *Proxy) *entry {
 			return context.WithValue(ctx, connContextKey, connContextFromClientConn(c))
 		},
 	}
+	if proxy.Opts.WithTLS {
+		e.server.TLSConfig = &tls.Config{
+			NextProtos: []string{"http/1.1"},
+		}
+	}
 	if proxy.Opts.HTTPSAddr != "" {
 		e.httpsServer = &http.Server{
 			Addr:    proxy.Opts.HTTPSAddr,
@@ -216,18 +221,27 @@ func connContextFromClientConn(c net.Conn) *ConnContext {
 	return c.(*wrapClientConn).connCtx
 }
 
+func (e *entry) loadServerCert() (tls.Certificate, error) {
+	if e.proxy.Opts.HTTPSCertFile == "" || e.proxy.Opts.HTTPSKeyFile == "" {
+		return tls.Certificate{}, fmt.Errorf("https proxy requires both cert and key files")
+	}
+	return tls.LoadX509KeyPair(e.proxy.Opts.HTTPSCertFile, e.proxy.Opts.HTTPSKeyFile)
+}
+
 func (e *entry) validateHTTPSConfig() error {
-	if e.httpsServer == nil {
+	if !e.proxy.Opts.WithTLS && e.httpsServer == nil {
 		return nil
 	}
-	if e.proxy.Opts.HTTPSCertFile == "" || e.proxy.Opts.HTTPSKeyFile == "" {
-		return fmt.Errorf("https proxy requires both cert and key files")
-	}
-	cert, err := tls.LoadX509KeyPair(e.proxy.Opts.HTTPSCertFile, e.proxy.Opts.HTTPSKeyFile)
+	cert, err := e.loadServerCert()
 	if err != nil {
 		return err
 	}
-	e.httpsServer.TLSConfig.Certificates = []tls.Certificate{cert}
+	if e.proxy.Opts.WithTLS {
+		e.server.TLSConfig.Certificates = []tls.Certificate{cert}
+	}
+	if e.httpsServer != nil {
+		e.httpsServer.TLSConfig.Certificates = []tls.Certificate{cert}
+	}
 	return nil
 }
 
@@ -235,13 +249,13 @@ func (e *entry) start() error {
 	if e.httpsServer != nil {
 		return e.startHTTPAndHTTPS()
 	}
-	return e.startServer(e.server, false)
+	return e.startServer(e.server, e.proxy.Opts.WithTLS)
 }
 
 func (e *entry) startHTTPAndHTTPS() error {
 	errCh := make(chan error, 2)
 	go func() {
-		errCh <- e.startServer(e.server, false)
+		errCh <- e.startServer(e.server, e.proxy.Opts.WithTLS)
 	}()
 	go func() {
 		errCh <- e.startServer(e.httpsServer, true)
@@ -263,9 +277,12 @@ func (e *entry) startServer(server *http.Server, isHTTPS bool) error {
 		return err
 	}
 
-	if isHTTPS {
+	switch {
+	case server == e.server && isHTTPS:
+		log.Infof("Proxy start listen at %v (over TLS)\n", server.Addr)
+	case isHTTPS:
 		log.Infof("HTTPS proxy start listen at %v\n", server.Addr)
-	} else {
+	default:
 		log.Infof("Proxy start listen at %v\n", server.Addr)
 	}
 	pln := &wrapListener{

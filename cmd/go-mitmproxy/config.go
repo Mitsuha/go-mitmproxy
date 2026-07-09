@@ -22,6 +22,7 @@ func loadConfigFromCli() *Config {
 	flag.BoolVar(&config.version, "version", false, "show go-mitmproxy version")
 	flag.StringVar(&config.Addr, "addr", ":9080", "proxy listen addr")
 	flag.StringVar(&config.HTTPSAddr, "https_addr", "", "https proxy listen addr")
+	flag.BoolVar(&config.WithTLS, "with_tls", false, "run the main proxy listener over TLS (uses https_cert/https_key)")
 	flag.StringVar(&config.HTTPSCert, "https_cert", "", "https proxy server certificate file")
 	flag.StringVar(&config.HTTPSKey, "https_key", "", "https proxy server private key file")
 	flag.StringVar(&config.WebAddr, "web_addr", ":9081", "web interface listen addr")
@@ -53,6 +54,9 @@ func mergeConfigs(fileConfig, cliConfig *Config) *Config {
 	}
 	if cliConfig.HTTPSAddr != "" {
 		config.HTTPSAddr = cliConfig.HTTPSAddr
+	}
+	if cliConfig.WithTLS {
+		config.WithTLS = cliConfig.WithTLS
 	}
 	if cliConfig.HTTPSCert != "" {
 		config.HTTPSCert = cliConfig.HTTPSCert

@@ -17,6 +17,7 @@ type Options struct {
 	Debug             int
 	Addr              string
 	HTTPSAddr         string
+	WithTLS           bool // 主代理监听端口 Addr 是否启用 TLS（http over TLS），证书取自 HTTPSCertFile/HTTPSKeyFile
 	HTTPSCertFile     string
 	HTTPSKeyFile      string
 	StreamLargeBodies int64 // 当请求或响应体大于此字节时，转为 stream 模式

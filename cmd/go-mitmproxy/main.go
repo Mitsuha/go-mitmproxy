@@ -19,6 +19,7 @@ type Config struct {
 
 	Addr         string   // proxy listen addr
 	HTTPSAddr    string   // https proxy listen addr
+	WithTLS      bool     // 主代理端口启用 TLS（http over TLS）
 	HTTPSCert    string   // https proxy server certificate file
 	HTTPSKey     string   // https proxy server private key file
 	WebAddr      string   // web interface listen addr
@@ -62,6 +63,7 @@ func main() {
 		Debug:             config.Debug,
 		Addr:              config.Addr,
 		HTTPSAddr:         config.HTTPSAddr,
+		WithTLS:           config.WithTLS,
 		HTTPSCertFile:     config.HTTPSCert,
 		HTTPSKeyFile:      config.HTTPSKey,
 		StreamLargeBodies: 1024 * 1024 * 5,
